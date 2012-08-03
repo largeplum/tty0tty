@@ -63,6 +63,15 @@ MODULE_LICENSE("GPL");
 #define MSR_DSR		0x40
 #define MSR_RI		0x80
 
+#define POLL_BUF_SIZE	4096
+
+struct tty0tty_poll {
+	int read_cnt;
+	int read_head;
+	int read_tail;
+	char read_buf[POLL_BUF_SIZE];
+}
+
 struct tty0tty_serial {
 	struct tty_struct	*tty;		/* pointer to the tty for this device */
 	int			open_count;	/* number of times this port has been opened */
@@ -76,6 +85,9 @@ struct tty0tty_serial {
 	struct serial_struct	serial;
 	wait_queue_head_t	wait;
 	struct async_icount	icount;
+
+	/* for poll functions */
+	struct tty0tty_poll	*poll;
 };
 
 static struct tty0tty_serial *tty0tty_table[TINY_TTY_MINORS];	/* initially all NULL */
@@ -187,7 +199,11 @@ static int tty0tty_write(struct tty_struct *tty, const unsigned char *buffer, in
 {
 	struct tty0tty_serial *tty0tty = tty->driver_data;
 	int retval = -EINVAL;
-	struct tty_struct  *ttyx = NULL;	
+	struct tty_struct  *ttyx = NULL;
+	int target_index = 0;
+	int i = 0;
+	int left = count;
+	struct tty0tty_poll *poll = NULL;
 
         if (!tty0tty)
 		return -ENODEV;
@@ -198,18 +214,14 @@ static int tty0tty_write(struct tty_struct *tty, const unsigned char *buffer, in
 		/* port was not opened */
 		goto exit;
 
-        if( (tty0tty->tty->index % 2) == 0)
-        { 
-         if(tty0tty_table[tty0tty->tty->index+1] != NULL) 
-	   if (tty0tty_table[tty0tty->tty->index+1]->open_count > 0)
-             ttyx=tty0tty_table[tty0tty->tty->index+1]->tty;
-        }
-        else
-        {
-         if(tty0tty_table[tty0tty->tty->index-1] != NULL) 
-	   if (tty0tty_table[tty0tty->tty->index-1]->open_count > 0)
-             ttyx=tty0tty_table[tty0tty->tty->index-1]->tty;
-        } 
+	target_index = (((tty0tty->tty->index % 2) == 0) ? 1 : -1) + tty0tty->tty->index;
+	if(tty0tty_table[target_index] != NULL)
+	{
+		if (tty0tty_table[target_index]->open_count > 0)
+			ttyx=tty0tty_table[target_index]->tty;
+		if (tty0tty_table[target_index]->poll != NULL)
+			poll=tty0tty_table[target_index]->poll;		
+	}
 
 //        tty->low_latency=1;
 
@@ -219,7 +231,30 @@ static int tty0tty_write(struct tty_struct *tty, const unsigned char *buffer, in
           tty_flip_buffer_push(ttyx);
 	  retval=count;
         } 
+
+	/* save bytes to the buffer for polled functions */
+	if(poll != NULL)
+	{
+		i = min(POLL_BUF_SIZE - poll->read_cnt,
+			POLL_BUF_SIZE - poll->read_head);
+		i = min(count, i);
+		memcpy(poll->read_buf + poll->read_head, buffer, i);
+		poll->read_head = (poll->read_head + i) & (POLL_BUF_SIZE-1);
+		tty->read_cnt += i;
+		buffer += i;
+		left -= i;
+
+		i = min(POLL_BUF_SIZE - tty->read_cnt,
+			POLL_BUF_SIZE - tty->read_head);
+		i = min(count, i);
+		memcpy(tty->read_buf + tty->read_head, buffer, i);
+		tty->read_head = (tty->read_head + i) & (POLL_BUF_SIZE-1);
+		tty->read_cnt += i;
+		left -= i;
 		
+		retval = count - left;
+	}
+
 exit:
 	up(&tty0tty->sem);
 	return retval;
@@ -556,6 +591,67 @@ static int tty0tty_ioctl(struct tty_struct *tty, struct file *file,
 	return -ENOIOCTLCMD;
 }
 
+#ifdef CONFIG_CONSOLE_POLL
+
+static int tty0tty_poll_init(struct tty_driver *driver, int line, char *options)
+{
+	struct tty0tty_serial *tty0tty = tty0tty_table[line];
+	if (tty0tty == NULL) {
+		/* first time accessing this device, let's create it */
+		tty0tty = kmalloc(sizeof(*tty0tty), GFP_KERNEL);
+		if (!tty0tty)
+			return -ENOMEM;
+
+		init_MUTEX(&tty0tty->sem);
+		tty0tty->open_count = 0;
+		tty0tty->poll = NULL;
+
+		tty0tty_table[index] = tty0tty;
+	}
+
+	tty0tty->poll = kmalloc(sizeof(*tty0tty->poll), GFP_KERNEL);
+	if (!tty0tty->poll)
+		return -ENOMEM;
+
+	down(&tty0tty->sem);
+	
+	tty0tty->poll->read_cnt = 0;
+	tty0tty->poll->read_head = 0;
+	tty0tty->poll->read_tail = 0;
+	/* ++tty0tty->open_count; */
+
+	up(&tty0tty->sem);
+
+	return 0;
+}
+
+static int tty0tty_poll_get_char(struct tty_driver *driver, int line)
+{
+	struct uart_driver *drv = driver->driver_state;
+	struct uart_state *state = drv->state + line;
+	struct uart_port *port;
+
+	if (!state || !state->uart_port)
+		return -1;
+
+	port = state->uart_port;
+	return port->ops->poll_get_char(port);
+}
+
+static void tty0tty_poll_put_char(struct tty_driver *driver, int line, char ch)
+{
+	struct uart_driver *drv = driver->driver_state;
+	struct uart_state *state = drv->state + line;
+	struct uart_port *port;
+
+	if (!state || !state->uart_port)
+		return;
+
+	port = state->uart_port;
+	port->ops->poll_put_char(port, ch);
+}
+#endif
+
 static struct tty_operations serial_ops = {
 	.open = tty0tty_open,
 	.close = tty0tty_close,
@@ -565,6 +661,12 @@ static struct tty_operations serial_ops = {
 	.tiocmget = tty0tty_tiocmget,
 	.tiocmset = tty0tty_tiocmset,
 	.ioctl = tty0tty_ioctl,
+#ifdef CONFIG_CONSOLE_POLL
+	.poll_init	= tty0tty_poll_init,
+	.poll_get_char	= tty0tty_poll_get_char,
+	.poll_put_char	= tty0tty_poll_put_char,
+#endif
+
 };
 
 static struct tty_driver *tty0tty_tty_driver;

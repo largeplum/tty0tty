@@ -237,7 +237,7 @@ static int tty0tty_write(struct tty_struct *tty, const unsigned char *buffer, in
 	{
 		i = min(POLL_BUF_SIZE - poll->read_cnt,
 			POLL_BUF_SIZE - poll->read_head);
-		i = min(count, i);
+		i = min(left, i);
 		memcpy(poll->read_buf + poll->read_head, buffer, i);
 		poll->read_head = (poll->read_head + i) & (POLL_BUF_SIZE-1);
 		tty->read_cnt += i;
@@ -246,7 +246,7 @@ static int tty0tty_write(struct tty_struct *tty, const unsigned char *buffer, in
 
 		i = min(POLL_BUF_SIZE - tty->read_cnt,
 			POLL_BUF_SIZE - tty->read_head);
-		i = min(count, i);
+		i = min(left, i);
 		memcpy(tty->read_buf + tty->read_head, buffer, i);
 		tty->read_head = (tty->read_head + i) & (POLL_BUF_SIZE-1);
 		tty->read_cnt += i;
@@ -627,28 +627,43 @@ static int tty0tty_poll_init(struct tty_driver *driver, int line, char *options)
 
 static int tty0tty_poll_get_char(struct tty_driver *driver, int line)
 {
-	struct uart_driver *drv = driver->driver_state;
-	struct uart_state *state = drv->state + line;
-	struct uart_port *port;
+	struct tty0tty_serial *tty0tty = tty0tty_table[line];
+	char c;
 
-	if (!state || !state->uart_port)
+	if (tty0tty == NULL || tty0tty0->poll == NULL)
+		return -1;
+	
+	if (tty0tty0->poll->read_cnt < 1)
 		return -1;
 
-	port = state->uart_port;
-	return port->ops->poll_get_char(port);
+	c = tty0tty->poll->read_buf[tty0tty->poll->read_tail++];
+	tty0tty->poll->read_tail &= POLL_BUF_SIZE - 1;
+	tty0tty->poll->read_cnt--;
+
+	return c;
 }
 
 static void tty0tty_poll_put_char(struct tty_driver *driver, int line, char ch)
 {
-	struct uart_driver *drv = driver->driver_state;
-	struct uart_state *state = drv->state + line;
-	struct uart_port *port;
+	struct tty0tty_serial *tty0tty = tty0tty_table[line];
+	struct tty_struct *ttyx = NULL;
 
-	if (!state || !state->uart_port)
+	if (tty0tty == NULL || tty0tty0->poll == NULL)
 		return;
 
-	port = state->uart_port;
-	port->ops->poll_put_char(port, ch);
+	/* write to it's counterpart */
+	target_index = (((line % 2) == 0) ? 1 : -1) + line;
+	if(tty0tty_table[target_index] != NULL)
+	{
+		if (tty0tty_table[target_index]->open_count > 0)
+			ttyx=tty0tty_table[target_index]->tty;
+	}
+
+	if(ttyx != NULL)
+	{
+		tty_insert_flip_string(ttyx, &ch, 1);
+		tty_flip_buffer_push(ttyx);
+	} 
 }
 #endif
 

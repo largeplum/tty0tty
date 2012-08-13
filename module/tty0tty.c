@@ -70,7 +70,7 @@ struct tty0tty_poll {
 	int read_head;
 	int read_tail;
 	char read_buf[POLL_BUF_SIZE];
-}
+};
 
 struct tty0tty_serial {
 	struct tty_struct	*tty;		/* pointer to the tty for this device */
@@ -115,11 +115,8 @@ static int tty0tty_open(struct tty_struct *tty, struct file *file)
 		if (!tty0tty)
 			return -ENOMEM;
 
-#ifdef __LINUX_SEMAPHORE_H
-		sema_init(&tty0tty->sem, 1);
-#else
 		init_MUTEX(&tty0tty->sem);
-#endif
+
 		tty0tty->open_count = 0;
 
 		tty0tty_table[index] = tty0tty;
@@ -204,6 +201,10 @@ static int tty0tty_write(struct tty_struct *tty, const unsigned char *buffer, in
 	int i = 0;
 	int left = count;
 	struct tty0tty_poll *poll = NULL;
+
+#ifdef SCULL_DEBUG
+	printk(KERN_DEBUG "%s: count=%i - \n", __FUNCTION__, count);
+#endif	
 
         if (!tty0tty)
 		return -ENODEV;
@@ -596,6 +597,11 @@ static int tty0tty_ioctl(struct tty_struct *tty, struct file *file,
 static int tty0tty_poll_init(struct tty_driver *driver, int line, char *options)
 {
 	struct tty0tty_serial *tty0tty = tty0tty_table[line];
+
+#ifdef SCULL_DEBUG
+	printk(KERN_DEBUG "%s - \n", __FUNCTION__);
+#endif	
+
 	if (tty0tty == NULL) {
 		/* first time accessing this device, let's create it */
 		tty0tty = kmalloc(sizeof(*tty0tty), GFP_KERNEL);
@@ -606,7 +612,7 @@ static int tty0tty_poll_init(struct tty_driver *driver, int line, char *options)
 		tty0tty->open_count = 0;
 		tty0tty->poll = NULL;
 
-		tty0tty_table[index] = tty0tty;
+		tty0tty_table[line] = tty0tty;
 	}
 
 	tty0tty->poll = kmalloc(sizeof(*tty0tty->poll), GFP_KERNEL);
@@ -628,42 +634,61 @@ static int tty0tty_poll_init(struct tty_driver *driver, int line, char *options)
 static int tty0tty_poll_get_char(struct tty_driver *driver, int line)
 {
 	struct tty0tty_serial *tty0tty = tty0tty_table[line];
-	char c;
+	char c = 0;
+	int retval = -1;
 
-	if (tty0tty == NULL || tty0tty0->poll == NULL)
-		return -1;
-	
-	if (tty0tty0->poll->read_cnt < 1)
-		return -1;
+	down(&tty0tty->sem);
 
-	c = tty0tty->poll->read_buf[tty0tty->poll->read_tail++];
-	tty0tty->poll->read_tail &= POLL_BUF_SIZE - 1;
-	tty0tty->poll->read_cnt--;
+	if (tty0tty == NULL || tty0tty->poll == NULL) {
+		retval = -1;
+	} else if (tty0tty->poll->read_cnt < 1) {
+		retval = -1;
+	} else {
+		c = tty0tty->poll->read_buf[tty0tty->poll->read_tail++];
+		tty0tty->poll->read_tail &= POLL_BUF_SIZE - 1;
+		tty0tty->poll->read_cnt--;
 
-	return c;
+		retval = c;
+	}
+
+	up(&tty0tty->sem);
+
+#ifdef SCULL_DEBUG
+	printk(KERN_DEBUG "%s: retval=%c - \n", __FUNCTION__, retval);
+#endif
+
+	return retval;
 }
 
 static void tty0tty_poll_put_char(struct tty_driver *driver, int line, char ch)
 {
 	struct tty0tty_serial *tty0tty = tty0tty_table[line];
 	struct tty_struct *ttyx = NULL;
+	int target_index = 0;
 
-	if (tty0tty == NULL || tty0tty0->poll == NULL)
-		return;
+	down(&tty0tty->sem);
 
-	/* write to it's counterpart */
-	target_index = (((line % 2) == 0) ? 1 : -1) + line;
-	if(tty0tty_table[target_index] != NULL)
-	{
-		if (tty0tty_table[target_index]->open_count > 0)
-			ttyx=tty0tty_table[target_index]->tty;
+	if (tty0tty != NULL && tty0tty->poll != NULL) {
+		/* write to it's counterpart */
+		target_index = (((line % 2) == 0) ? 1 : -1) + line;
+		if(tty0tty_table[target_index] != NULL)
+		{
+			if (tty0tty_table[target_index]->open_count > 0)
+				ttyx=tty0tty_table[target_index]->tty;
+		}
+
+		if(ttyx != NULL)
+		{
+			tty_insert_flip_string(ttyx, &ch, 1);
+			tty_flip_buffer_push(ttyx);
+		}
 	}
 
-	if(ttyx != NULL)
-	{
-		tty_insert_flip_string(ttyx, &ch, 1);
-		tty_flip_buffer_push(ttyx);
-	} 
+	up(&tty0tty->sem);
+
+#ifdef SCULL_DEBUG
+	printk(KERN_DEBUG "%s: line=%i, ch=%c - \n", __FUNCTION__, line, ch);
+#endif
 }
 #endif
 
